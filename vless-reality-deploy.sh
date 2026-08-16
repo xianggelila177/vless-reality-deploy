@@ -22,6 +22,7 @@
 #   --zram              强制部署 zRAM（默认 auto：无 swap 且内存 ≤4GB 时自动部署）
 #   --no-zram           禁用 zRAM
 #   --no-cleanup-cron   不部署每周定时清理
+#   --no-warp           不部署 Cloudflare WARP 分流（默认自动部署）
 #
 # 幂等：重复运行不会重复安装，密钥和 UUID 保存在 /usr/local/etc/xray/.deploy-info
 #
@@ -47,7 +48,7 @@
 
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 # ─── 可配置项 ────────────────────────────────────────────────────────────────
 XRAY_PORT="${XRAY_PORT:-443}"
@@ -66,6 +67,7 @@ DO_CLEAN=0
 WITH_TZ=1
 WITH_CRON=1
 WITH_ZRAM=auto                         # auto / force / no
+WITH_WARP=1                            # 默认部署 WARP 分流
 
 STATE_FILE="/usr/local/etc/xray/.deploy-info"
 CLEAN_SCRIPT="/usr/local/sbin/vless-deploy-clean.sh"
@@ -116,6 +118,7 @@ while [ $# -gt 0 ]; do
     --zram)             WITH_ZRAM=force; shift ;;
     --no-zram)          WITH_ZRAM=no; shift ;;
     --no-cleanup-cron)  WITH_CRON=0; shift ;;
+    --no-warp)          WITH_WARP=0; shift ;;
     -h|--help)          sed -n '2,/^set /{/^set /!{s/^# \?//;p}}' "$0"; exit 0 ;;
     *)                  die "未知参数: $1" ;;
   esac
@@ -162,6 +165,39 @@ install_xray(){
 }
 
 # ─── 阶段 2: 生成密钥并写入配置 ─────────────────────────────────────────────
+
+# 安装 Cloudflare WARP 并设为 SOCKS5 代理模式（不改全局路由）。
+# 受限域名（OpenAI/Grok/Netflix 等）通过 Xray 路由规则分流到 WARP 出口，
+# 其余流量保持直连。WARP 出口是 Cloudflare 高信誉 IP，能过大部分 WAF。
+setup_warp(){
+  [ "$WITH_WARP" = 1 ] || return 0
+  if command -v warp-cli > /dev/null 2>&1 && warp-cli --accept-tos status 2>&1 | grep -q "Connected"; then
+    info "WARP 已安装并连接"
+    return 0
+  fi
+  info "安装 Cloudflare WARP (SOCKS5 代理模式, 不改路由)…"
+  apt_install gnupg2 || { warn "gnupg2 安装失败，跳过 WARP"; return 0; }
+  curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+    | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg 2>/dev/null \
+    || { warn "WARP GPG key 导入失败，跳过"; return 0; }
+  local codename; codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
+  echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $codename main" \
+    > /etc/apt/sources.list.d/cloudflare-client.list
+  apt-get update -qq 2>/dev/null
+  apt_install cloudflare-warp || { warn "WARP 安装失败，跳过"; return 0; }
+  warp-cli --accept-tos registration new 2>/dev/null || true
+  warp-cli --accept-tos mode proxy > /dev/null 2>&1
+  warp-cli --accept-tos proxy port 40000 > /dev/null 2>&1
+  warp-cli --accept-tos connect > /dev/null 2>&1
+  sleep 3
+  if warp-cli --accept-tos status 2>&1 | grep -q "Connected"; then
+    local warp_ip; warp_ip=$(curl -s4 --max-time 8 --socks5-hostname 127.0.0.1:40000 ifconfig.co 2>/dev/null)
+    ok "WARP 已连接: SOCKS5 127.0.0.1:40000, 出口 IP ${warp_ip:-unknown} (Cloudflare)"
+  else
+    warn "WARP 连接失败，分流不生效（不影响代理主功能）"
+  fi
+}
+
 configure_xray(){
   info "[2/6] 配置 VLESS + Reality + Vision"
 
@@ -197,61 +233,81 @@ EOF
     ok "密钥已生成并保存到 $STATE_FILE"
   fi
 
-  cat > /usr/local/etc/xray/config.json <<EOF
-{
-  "log": { "loglevel": "warning" },
-  "inbounds": [
-    {
-      "listen": "0.0.0.0",
-      "port": $PORT,
-      "protocol": "vless",
-      "settings": {
-        "clients": [
-          {
-            "id": "$UUID",
-            "flow": "xtls-rprx-vision"
-          }
-        ],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "tcp",
-        "security": "reality",
-        "realitySettings": {
-          "show": false,
-          "dest": "$REALITY_DEST",
-          "xver": 0,
-          "serverNames": ["$SNI"],
-          "privateKey": "$PRIVATE_KEY",
-          "shortIds": ["$SHORT_ID"]
-        },
-        "sockopt": {
-          "tcpFastOpen": true,
-          "tcpNoDelay": true,
-          "tcpKeepAliveInterval": 30,
-          "mark": 255
-        }
-      },
-      "sniffing": {
-        "enabled": true,
-        "destOverride": ["http", "tls", "quic"],
-        "routeOnly": true
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "protocol": "freedom",
-      "tag": "direct",
-      "settings": { "domainStrategy": "UseIPv4v6" }
-    },
-    {
-      "protocol": "blackhole",
-      "tag": "block"
-    }
-  ]
+  python3 -c "
+import json
+
+warp_outbound = {
+    'protocol': 'socks',
+    'tag': 'warp',
+    'settings': {'servers': [{'address': '127.0.0.1', 'port': 40000}]},
+    'streamSettings': {'sockopt': {'mark': 255}}
 }
-EOF
+
+warp_domains = [
+    'domain:openai.com', 'domain:chatgpt.com', 'domain:oaistatic.com',
+    'domain:oaiusercontent.com', 'domain:x.ai', 'domain:grok.x.ai',
+    'domain:gemini.google.com', 'domain:bard.google.com',
+    'domain:deepmind.google.com', 'domain:deepmind.com',
+    'domain:netflix.com', 'domain:nflxext.com', 'domain:nflximg.com',
+    'domain:nflximg.net', 'domain:nflxso.net', 'domain:nflxvideo.net',
+    'domain:disneyplus.com', 'domain:dssott.com', 'domain:bamgrid.com',
+    'domain:hulu.com', 'domain:hulustream.com',
+    'domain:spotify.com', 'domain:scdn.co',
+    'domain:claude.ai', 'domain:anthropic.com',
+]
+
+config = {
+    'log': {'loglevel': 'warning'},
+    'inbounds': [{
+        'listen': '0.0.0.0',
+        'port': int('$PORT'),
+        'protocol': 'vless',
+        'settings': {
+            'clients': [{'id': '$UUID', 'flow': 'xtls-rprx-vision'}],
+            'decryption': 'none'
+        },
+        'streamSettings': {
+            'network': 'tcp',
+            'security': 'reality',
+            'realitySettings': {
+                'show': False,
+                'dest': '$REALITY_DEST',
+                'xver': 0,
+                'serverNames': ['$SNI'],
+                'privateKey': '$PRIVATE_KEY',
+                'shortIds': ['$SHORT_ID']
+            },
+            'sockopt': {
+                'tcpFastOpen': True,
+                'tcpNoDelay': True,
+                'tcpKeepAliveInterval': 30,
+                'mark': 255
+            }
+        },
+        'sniffing': {
+            'enabled': True,
+            'destOverride': ['http', 'tls', 'quic'],
+            'routeOnly': True
+        }
+    }],
+    'outbounds': [
+        {'protocol': 'freedom', 'tag': 'direct', 'settings': {'domainStrategy': 'UseIPv4v6'}},
+        warp_outbound,
+        {'protocol': 'blackhole', 'tag': 'block'}
+    ],
+    'routing': {
+        'domainStrategy': 'IPIfNonMatch',
+        'rules': [{
+            'type': 'field',
+            'outboundTag': 'warp',
+            'domain': warp_domains
+        }]
+    }
+}
+
+json.dump(config, open('/usr/local/etc/xray/config.json', 'w'), indent=2, ensure_ascii=False)
+print('Config written')
+" || die "Xray 配置生成失败"
 
   xray -test -config /usr/local/etc/xray/config.json 2>&1 | grep -q "Configuration OK" \
     || die "Xray 配置验证失败"
@@ -491,6 +547,8 @@ print_result(){
   printf '  %-14s %s\n' "Swap/zRAM:" "$(free -m | awk '/^Swap:/{if($2==0) print "none"; else print $2" MB"}')"
   printf '  %-14s %s\n' "时区:"      "$(timedatectl show -p Timezone --value 2>/dev/null)"
   printf '  %-14s %s\n' "定时清理:"  "$(crontab -l 2>/dev/null | grep -q "$CRON_MARK" && echo '每周一 06:06' || echo 未部署)"
+  local warp_st; warp_st=$(warp-cli --accept-tos status 2>/dev/null | grep "^Status" | awk '{print $NF}')
+  printf '  %-14s %s\n' "WARP:"     "${warp_st:-未安装}"
   echo
   echo "${B}── 管理命令 ──${P}"
   echo "  tcpfit status                          # 查看当前调优状态"
@@ -521,6 +579,7 @@ if [ "$EXTRAS_ONLY" = 1 ]; then
 fi
 
 install_xray
+setup_warp
 configure_xray
 setup_firewall
 optimize_network
