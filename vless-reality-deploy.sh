@@ -244,15 +244,11 @@ warp_outbound = {
 }
 
 warp_domains = [
-    'domain:openai.com', 'domain:chatgpt.com', 'domain:oaistatic.com',
-    'domain:oaiusercontent.com', 'domain:x.ai', 'domain:grok.x.ai',
-    'domain:gemini.google.com', 'domain:bard.google.com',
-    'domain:deepmind.google.com', 'domain:deepmind.com',
+    'domain:x.ai', 'domain:grok.x.ai',
     'domain:netflix.com', 'domain:nflxext.com', 'domain:nflximg.com',
     'domain:nflximg.net', 'domain:nflxso.net', 'domain:nflxvideo.net',
     'domain:disneyplus.com', 'domain:dssott.com', 'domain:bamgrid.com',
     'domain:hulu.com', 'domain:hulustream.com',
-    'domain:spotify.com', 'domain:scdn.co',
     'domain:claude.ai', 'domain:anthropic.com',
 ]
 
