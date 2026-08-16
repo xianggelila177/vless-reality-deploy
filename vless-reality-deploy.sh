@@ -149,44 +149,69 @@ self_install(){
 }
 
 # ─── Reality SNI 自动选择 ──────────────────────────────────────────────────
-# 从全球知名大站中筛选：支持 TLS1.3 + HTTP/2 + 不跳转到其他域名 + 全球可达。
+# 基础池：全球知名大站，TLS1.3+H2 大概率支持，且在全球主要国家均可用。
 # 刻意排除了 Google/Cloudflare/YouTube/Facebook 等在部分国家不可用的域名。
 SNI_CANDIDATES="
 www.amazon.com www.apple.com www.microsoft.com www.bing.com gateway.icloud.com
 www.nvidia.com www.intel.com www.amd.com www.adobe.com www.oracle.com
 www.ibm.com www.cisco.com www.salesforce.com www.dell.com www.hp.com
 www.tesla.com www.walmart.com www.ebay.com www.costco.com www.target.com
-www.samsung.com www.sony.com www.nintendo.com www.softbank.jp www.rakuten.co.jp
-www.yahoo.co.jp www.asus.com www.tsmc.com www.lg.com www.canon.com
-www.fujitsu.com www.panasonic.com www.toyota.com www.honda.com www.bmw.com
-www.sap.com www.siemens.com www.philips.com www.bosch.com www.shell.com
-www.airbus.com www.gov.uk www.volkswagen.com www.ericsson.com www.nokia.com
+www.samsung.com www.sony.com www.nintendo.com www.bmw.com www.volkswagen.com
+www.toyota.com www.honda.com www.softbank.jp www.yahoo.co.jp www.rakuten.co.jp
+www.asus.com www.tsmc.com www.lg.com www.canon.com www.fujitsu.com
+www.panasonic.com www.sap.com www.siemens.com www.philips.com www.bosch.com
+www.shell.com www.airbus.com www.gov.uk www.ericsson.com www.nokia.com
 "
+
+# 按 VPS 所在国家/地区补充本地大站候选。
+# 只放知名企业的官网，流量画像合理。
+pick_regional_sni(){
+  local cc; cc=$(curl -s4 --max-time 5 ipinfo.io/country 2>/dev/null | tr -d '[:space:]')
+  case "$cc" in
+    JP) echo "www.nec.com www.ntt.com www.recruit.co.jp www.dmm.com www.mitsubishi.com www.bridgestone.com" ;;
+    MY) echo "www.maybank.com www.maxis.com.my www.celcom.com.my www.cimb.com www.petronas.com www.airasia.com" ;;
+    SG) echo "www.dbs.com www.ocbc.com www.uob.com.sg www.singtel.com www.starhub.com" ;;
+    HK) echo "www.hsbc.com.hk www.hangseng.com www.cathaypacific.com www.mtr.com.hk www.hkex.com.hk" ;;
+    TW) echo "www.cht.com.tw www.taiwanmobile.com www.umc.com www.mediatek.com www.foxconn.com" ;;
+    KR) echo "www.samsung.com www.lg.com www.hyundai.com www.kia.com www.naver.com www.kakao.com" ;;
+    DE) echo "www.sap.com www.siemens.com www.bmw.com www.volkswagen.com www.bosch.com www.basf.com" ;;
+    GB|UK) echo "www.gov.uk www.bbc.com www.hsbc.com www.barclays.com www.bp.com www.vodafone.com" ;;
+    FR) echo "www.orange.com www.bnpparibas.com www.airbus.com www.renault.com www.totalenergies.com" ;;
+    NL) echo "www.philips.com www.shell.com www.ing.com www.klm.com www.heineken.com" ;;
+    AU) echo "www.anz.com.au www.commbank.com.au www.telstra.com.au www.woolworths.com.au www.bhp.com" ;;
+    CA) echo "www.rbc.com www.td.com www.scotiabank.com www.shopify.com www.aircanada.com" ;;
+    IN) echo "www.reliance.com www.tcs.com www.infosys.com www.airtel.in www.icicibank.com" ;;
+    BR) echo "www.petrobras.com.br www.vale.com www.embraer.com www.bancobradesco.com.br www.ambev.com.br" ;;
+    US) echo "www.amazon.com www.walmart.com www.apple.com www.tesla.com www.costco.com www.dell.com" ;;
+    *)  echo "" ;;
+  esac
+}
 
 pick_sni(){
   [ "$REALITY_DEST" = auto ] || return 0
-  info "自动选择 Reality 伪装域名（检测 TLS1.3 + H2 + 重定向）…"
+  info "自动选择 Reality 伪装域名（检测 TLS1.3 + H2 + 重定向 + RTT）…"
+
+  local regional; regional=$(pick_regional_sni)
+  local all="$SNI_CANDIDATES $regional"
+  local cc; cc=$(curl -s4 --max-time 5 ipinfo.io/country 2>/dev/null | tr -d '[:space:]')
+  [ -n "$regional" ] && info "地区: $cc, 补充候选: $(echo $regional | tr ' ' ', ')"
 
   local tmpd; tmpd=$(mktemp -d)
   local d
-  for d in $SNI_CANDIDATES; do
+  for d in $all; do
     (
-      # TLS1.3 必须支持
       code=$(curl -sI -o /dev/null --connect-timeout 3 --max-time 5 \
              --tlsv1.3 --tls-max 1.3 -w "%{http_code}" "https://$d/" 2>/dev/null)
       [ "$code" != "000" ] && [ -n "$code" ] || exit 1
-      # HTTP/2 必须支持
       h2=$(curl -sI --http2 --connect-timeout 3 --max-time 5 -o /dev/null \
            -w "%{http_version}" "https://$d/" 2>/dev/null)
       [ "$h2" = "2" ] || exit 1
-      # 不允许跳转到其他域名（同域名 self-redirect 可以）
       loc=$(curl -sI --connect-timeout 3 --max-time 5 "https://$d/" 2>/dev/null \
             | grep -i '^location:' | head -1 | tr -d '\r')
       if [ -n "$loc" ]; then
         target=$(echo "$loc" | awk '{print $2}' | sed 's|https\?://||;s|/.*||')
         [ "$target" = "$d" ] || [ -z "$target" ] || exit 1
       fi
-      # 测 RTT（time_connect - time_namelookup 隔离 DNS 解析）
       times=$(curl -sI -o /dev/null --connect-timeout 3 --max-time 5 \
               -w "%{time_connect} %{time_namelookup}" "https://$d/" 2>/dev/null)
       [ -n "$times" ] || exit 1
@@ -197,8 +222,12 @@ pick_sni(){
   done
   wait
 
-  local best; best=$(cat "$tmpd"/* 2>/dev/null | sort -n | head -1)
-  if [ -n "$best" ]; then
+  local top5; top5=$(cat "$tmpd"/* 2>/dev/null | sort -n | head -5)
+  if [ -n "$top5" ]; then
+    echo "$top5" | while read -r ms d; do
+      printf "    %4d ms  %s\n" "$ms" "$d"
+    done
+    local best; best=$(echo "$top5" | head -1)
     REALITY_SNI=$(echo "$best" | awk '{print $2}')
     REALITY_DEST="${REALITY_SNI}:443"
     ok "选定: $REALITY_SNI (RTT $(echo "$best" | awk '{print $1}')ms)"
@@ -209,6 +238,7 @@ pick_sni(){
   fi
   rm -rf "$tmpd"
 }
+
 
 # ─── 打印客户端配置 ─────────────────────────────────────────────────────────
 cmd_show_config(){
