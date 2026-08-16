@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
 # vless-reality-deploy — VLESS + Reality + Vision 一键部署与线路优化
 #
-# 在裸 Debian/Ubuntu VPS 上从零部署 Xray VLESS-Reality 代理，
-# 并应用经过实测的 TCP 内核优化（含 tcpfit BDP 推导 + 限速器整形），
-# 外加系统 housekeeping：zRAM 压缩交换 / 时区 / 定时清理。
+# 一键命令（推荐）:
+#   bash <(curl -fsSL https://raw.githubusercontent.com/xianggelila177/vless-reality-deploy/main/vless-reality-deploy.sh)
 #
-# 用法:
-#   bash vless-reality-deploy.sh                 # 完整部署（推荐）
-#   bash vless-reality-deploy.sh --skip-sweep    # 跳过限速器扫描（省 10-20GB 流量）
-#   bash vless-reality-deploy.sh --optimize-only # 只做网络优化，不重装 Xray
-#   bash vless-reality-deploy.sh --extras-only   # 只做系统附加项（zRAM/时区/定时清理）
-#   bash vless-reality-deploy.sh --clean         # 立即清理系统垃圾（日志/缓存）
-#   bash vless-reality-deploy.sh --show-config   # 打印当前客户端配置
+# 装完后脚本会自动复制到 /usr/local/bin/vless-deploy，以后敲 vless-deploy 即可。
+#
+# 子命令:
+#   vless-deploy --skip-sweep      # 跳过限速器扫描（省 10-20GB 流量）
+#   vless-deploy --optimize-only   # 只做网络优化，不重装 Xray
+#   vless-deploy --extras-only     # 只做系统附加项（zRAM/时区/定时清理）
+#   vless-deploy --clean           # 立即清理系统垃圾
+#   vless-deploy --show-config     # 打印当前客户端配置
 #
 # 选项:
 #   --bw <Mbps>         标称带宽，tcpfit 用它推导 BDP（默认 500）
 #   --sweep-peer <主机> iperf3 测速对端（默认按 ping 自动选最近公共节点）
 #   --port <端口>       代理监听端口（默认 443）
-#   --dest <host:443>   Reality 伪装目标（默认 www.amazon.com:443）
+#   --dest <host:443>   Reality 伪装目标（默认 auto：按 RTT 自动选最近的大站）
 #   --tz <时区>         系统时区（默认 Asia/Shanghai；--no-tz 跳过）
 #   --zram              强制部署 zRAM（默认 auto：无 swap 且内存 ≤4GB 时自动部署）
 #   --no-zram           禁用 zRAM
@@ -37,26 +37,28 @@
 #   7. UFW 防火墙: 仅放行 SSH/代理端口
 #   8. zRAM 压缩交换区（lz4，无 swap 的小内存机自动部署）
 #   9. 系统时区设置（默认 Asia/Shanghai）
-#  10. 每周定时清理 journald/apt/docker 垃圾，防止磁盘撑爆
+#  10. 每周定时清理 journald/apt/docker 垃圾
+#  11. Cloudflare WARP SOCKS5 分流（Grok/Netflix/Disney+/Hulu/Claude 走 CF 出口）
+#  12. Reality SNI 自动选择：从 45 个全球大站中实测筛选（TLS1.3+H2+不跳转+低RTT）
 #
 # 安全说明:
 #   - UUID / 密钥对 / shortId 全部在运行时由 Xray 生成，不写死在脚本里
-#   - Reality 伪装目标默认 www.amazon.com:443（可改 REALITY_DEST）
 #   - tcpfit 快照保存在 /var/lib/tcpfit/，随时可 tcpfit rollback
-#   - 清理逻辑刻意不 pkill apt/dpkg —— 强杀包管理器可能损坏 dpkg 数据库，
-#     清理失败就等下周，比搞坏系统便宜
+#   - 清理逻辑刻意不 pkill apt/dpkg —— 强杀包管理器可能损坏 dpkg 数据库
+#   - Reality SNI 候选池刻意排除了 Google/Cloudflare/YouTube/Facebook 等
+#     在部分国家不可用的域名，只保留全球可达的大站
 
 set -euo pipefail
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 
 # ─── 可配置项 ────────────────────────────────────────────────────────────────
 XRAY_PORT="${XRAY_PORT:-443}"
 SSH_PORT="${SSH_PORT:-22}"
-REALITY_DEST="${REALITY_DEST:-www.amazon.com:443}"
-REALITY_SNI="${REALITY_SNI:-www.amazon.com}"
-BANDWIDTH="${BANDWIDTH:-500}"          # Mbps, 用于 tcpfit 推导 BDP
-SWEEP_PEER="${SWEEP_PEER:-}"           # iperf3 对端, 留空则自动选
+REALITY_DEST="${REALITY_DEST:-auto}"   # auto = 自动选择
+REALITY_SNI="${REALITY_SNI:-auto}"
+BANDWIDTH="${BANDWIDTH:-500}"
+SWEEP_PEER="${SWEEP_PEER:-}"
 DEPLOY_TZ="${DEPLOY_TZ:-Asia/Shanghai}"
 
 SKIP_SWEEP=0
@@ -66,14 +68,16 @@ SHOW_CONFIG=0
 DO_CLEAN=0
 WITH_TZ=1
 WITH_CRON=1
-WITH_ZRAM=auto                         # auto / force / no
-WITH_WARP=1                            # 默认部署 WARP 分流
+WITH_ZRAM=auto
+WITH_WARP=1
 
 STATE_FILE="/usr/local/etc/xray/.deploy-info"
+SELF_PATH="/usr/local/bin/vless-deploy"
 CLEAN_SCRIPT="/usr/local/sbin/vless-deploy-clean.sh"
 CRON_MARK="vless-deploy-clean"
 TCPFIT_VERSION="0.5.6"
 TCPFIT_URL="https://raw.githubusercontent.com/Kylin010/tcpfit/v${TCPFIT_VERSION}/tcpfit.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/xianggelila177/vless-reality-deploy/v${VERSION}/vless-reality-deploy.sh"
 
 # ─── 颜色 ────────────────────────────────────────────────────────────────────
 if [ -t 1 ]; then
@@ -88,8 +92,6 @@ die(){  printf '%s %s\n' "${R}[x]${P}" "$*" >&2; exit "${2:-1}"; }
 
 # ─── 参数解析 ────────────────────────────────────────────────────────────────
 
-# apt/dpkg 锁等待：unattended-upgrades 等后台任务会短暂持有锁，
-# 直接装包会拿锁失败。最多等 120 秒，超时就返回失败让调用方决定。
 apt_install(){
   local i
   for i in $(seq 1 12); do
@@ -97,11 +99,12 @@ apt_install(){
       DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" > /dev/null 2>&1
       return $?
     fi
-    [ "$i" = 1 ] && info "等待 apt/dpkg 锁释放（unattended-upgrades 正在运行）…"
+    [ "$i" = 1 ] && info "等待 apt/dpkg 锁释放…"
     sleep 10
   done
   return 1
 }
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --skip-sweep)       SKIP_SWEEP=1; shift ;;
@@ -128,10 +131,88 @@ need_root(){ [ "$(id -u)" = 0 ] || die "需要 root 权限"; }
 
 detect_iface(){ ip -4 route show default 2>/dev/null | awk '{print $5; exit}'; }
 
-# ─── 打印已保存的客户端配置 ─────────────────────────────────────────────────
+# ─── 自安装（curl-pipe-bash 模式） ─────────────────────────────────────────
+# bash <(curl ...) 时 $0 是 /dev/fd/63，脚本一退出就没了。
+# 把同一版本装到 /usr/local/bin/vless-deploy，以后想回滚/查状态还能找到。
+self_install(){
+  [ "$(id -u)" = 0 ] || return 0
+  case "$0" in "$SELF_PATH") return 0 ;; esac
+  command -v curl >/dev/null || return 0
+  curl -fsSL "$SCRIPT_URL" -o "$SELF_PATH.tmp" 2>/dev/null || { rm -f "$SELF_PATH.tmp"; return 0; }
+  if [ -s "$SELF_PATH.tmp" ] && head -1 "$SELF_PATH.tmp" | grep -q '^#!' \
+     && grep -q "^VERSION=\"$VERSION\"" "$SELF_PATH.tmp"; then
+    mv "$SELF_PATH.tmp" "$SELF_PATH"; chmod +x "$SELF_PATH"
+    ok "已安装到 $SELF_PATH，以后敲 vless-deploy 即可"
+  else
+    rm -f "$SELF_PATH.tmp"
+  fi
+}
+
+# ─── Reality SNI 自动选择 ──────────────────────────────────────────────────
+# 从全球知名大站中筛选：支持 TLS1.3 + HTTP/2 + 不跳转到其他域名 + 全球可达。
+# 刻意排除了 Google/Cloudflare/YouTube/Facebook 等在部分国家不可用的域名。
+SNI_CANDIDATES="
+www.amazon.com www.apple.com www.microsoft.com www.bing.com gateway.icloud.com
+www.nvidia.com www.intel.com www.amd.com www.adobe.com www.oracle.com
+www.ibm.com www.cisco.com www.salesforce.com www.dell.com www.hp.com
+www.tesla.com www.walmart.com www.ebay.com www.costco.com www.target.com
+www.samsung.com www.sony.com www.nintendo.com www.softbank.jp www.rakuten.co.jp
+www.yahoo.co.jp www.asus.com www.tsmc.com www.lg.com www.canon.com
+www.fujitsu.com www.panasonic.com www.toyota.com www.honda.com www.bmw.com
+www.sap.com www.siemens.com www.philips.com www.bosch.com www.shell.com
+www.airbus.com www.gov.uk www.volkswagen.com www.ericsson.com www.nokia.com
+"
+
+pick_sni(){
+  [ "$REALITY_DEST" = auto ] || return 0
+  info "自动选择 Reality 伪装域名（检测 TLS1.3 + H2 + 重定向）…"
+
+  local tmpd; tmpd=$(mktemp -d)
+  local d
+  for d in $SNI_CANDIDATES; do
+    (
+      # TLS1.3 必须支持
+      code=$(curl -sI -o /dev/null --connect-timeout 3 --max-time 5 \
+             --tlsv1.3 --tls-max 1.3 -w "%{http_code}" "https://$d/" 2>/dev/null)
+      [ "$code" != "000" ] && [ -n "$code" ] || exit 1
+      # HTTP/2 必须支持
+      h2=$(curl -sI --http2 --connect-timeout 3 --max-time 5 -o /dev/null \
+           -w "%{http_version}" "https://$d/" 2>/dev/null)
+      [ "$h2" = "2" ] || exit 1
+      # 不允许跳转到其他域名（同域名 self-redirect 可以）
+      loc=$(curl -sI --connect-timeout 3 --max-time 5 "https://$d/" 2>/dev/null \
+            | grep -i '^location:' | head -1 | tr -d '\r')
+      if [ -n "$loc" ]; then
+        target=$(echo "$loc" | awk '{print $2}' | sed 's|https\?://||;s|/.*||')
+        [ "$target" = "$d" ] || [ -z "$target" ] || exit 1
+      fi
+      # 测 RTT（time_connect - time_namelookup 隔离 DNS 解析）
+      times=$(curl -sI -o /dev/null --connect-timeout 3 --max-time 5 \
+              -w "%{time_connect} %{time_namelookup}" "https://$d/" 2>/dev/null)
+      [ -n "$times" ] || exit 1
+      ms=$(awk -v c=$(echo "$times" | awk '{print $1}') -v n=$(echo "$times" | awk '{print $2}') \
+           'BEGIN{printf "%d", (c-n)*1000}')
+      echo "$ms $d" > "$tmpd/$d"
+    ) &
+  done
+  wait
+
+  local best; best=$(cat "$tmpd"/* 2>/dev/null | sort -n | head -1)
+  if [ -n "$best" ]; then
+    REALITY_SNI=$(echo "$best" | awk '{print $2}')
+    REALITY_DEST="${REALITY_SNI}:443"
+    ok "选定: $REALITY_SNI (RTT $(echo "$best" | awk '{print $1}')ms)"
+  else
+    REALITY_SNI="www.amazon.com"
+    REALITY_DEST="www.amazon.com:443"
+    warn "所有候选域名检测失败，回退到 $REALITY_SNI"
+  fi
+  rm -rf "$tmpd"
+}
+
+# ─── 打印客户端配置 ─────────────────────────────────────────────────────────
 cmd_show_config(){
   [ -f "$STATE_FILE" ] || die "未找到部署信息，请先运行完整部署"
-  # shellcheck disable=SC1090
   . "$STATE_FILE"
   echo
   echo "${B}── vless 分享链接 ──${P}"
@@ -155,7 +236,7 @@ install_xray(){
   info "[1/6] 安装 Xray-core"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
-  apt_install curl unzip ufw jq || die "基础依赖安装失败（apt 锁被占用超过 2 分钟）"
+  apt_install curl unzip ufw jq python3 || die "基础依赖安装失败"
 
   if ! command -v xray >/dev/null 2>&1; then
     bash -c "$(curl -sL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install 2>&1 | tail -3
@@ -164,11 +245,8 @@ install_xray(){
   fi
 }
 
-# ─── 阶段 2: 生成密钥并写入配置 ─────────────────────────────────────────────
+# ─── 阶段 2: WARP + Xray 配置 ──────────────────────────────────────────────
 
-# 安装 Cloudflare WARP 并设为 SOCKS5 代理模式（不改全局路由）。
-# 受限域名（OpenAI/Grok/Netflix 等）通过 Xray 路由规则分流到 WARP 出口，
-# 其余流量保持直连。WARP 出口是 Cloudflare 高信誉 IP，能过大部分 WAF。
 setup_warp(){
   [ "$WITH_WARP" = 1 ] || return 0
   if command -v warp-cli > /dev/null 2>&1 && warp-cli --accept-tos status 2>&1 | grep -q "Connected"; then
@@ -192,19 +270,24 @@ setup_warp(){
   sleep 3
   if warp-cli --accept-tos status 2>&1 | grep -q "Connected"; then
     local warp_ip; warp_ip=$(curl -s4 --max-time 8 --socks5-hostname 127.0.0.1:40000 ifconfig.co 2>/dev/null)
-    ok "WARP 已连接: SOCKS5 127.0.0.1:40000, 出口 IP ${warp_ip:-unknown} (Cloudflare)"
+    ok "WARP 已连接: SOCKS5 127.0.0.1:40000, 出口 ${warp_ip:-unknown} (Cloudflare)"
   else
     warn "WARP 连接失败，分流不生效（不影响代理主功能）"
   fi
 }
 
 configure_xray(){
-  info "[2/6] 配置 VLESS + Reality + Vision"
+  info "[2/6] 配置 VLESS + Reality + Vision (SNI: $REALITY_SNI)"
 
   if [ -f "$STATE_FILE" ]; then
-    # shellcheck disable=SC1090
     . "$STATE_FILE"
     info "复用已有密钥 (UUID: ${UUID:0:8}...)"
+    # 如果 SNI 重新选了不同的，更新 state
+    if [ "$SNI" != "$REALITY_SNI" ]; then
+      SNI="$REALITY_SNI"
+      sed -i "s|^SNI=.*|SNI=$SNI|" "$STATE_FILE"
+      info "SNI 已更新: $SNI"
+    fi
   else
     local keys
     keys=$(xray x25519)
@@ -302,13 +385,11 @@ config = {
 }
 
 json.dump(config, open('/usr/local/etc/xray/config.json', 'w'), indent=2, ensure_ascii=False)
-print('Config written')
 " || die "Xray 配置生成失败"
 
   xray -test -config /usr/local/etc/xray/config.json 2>&1 | grep -q "Configuration OK" \
     || die "Xray 配置验证失败"
 
-  # systemd 文件描述符上限
   mkdir -p /etc/systemd/system/xray.service.d
   cat > /etc/systemd/system/xray.service.d/limits.conf <<'EOF'
 [Service]
@@ -319,7 +400,7 @@ EOF
   systemctl restart xray
   sleep 2
   systemctl is-active xray > /dev/null || die "Xray 启动失败"
-  ok "Xray 运行在 :$PORT (VLESS + Reality + Vision + sockopt)"
+  ok "Xray 运行在 :$PORT (VLESS + Reality + Vision, SNI=$SNI)"
 }
 
 # ─── 阶段 3: 防火墙 ─────────────────────────────────────────────────────────
@@ -339,7 +420,6 @@ setup_firewall(){
 optimize_network(){
   info "[4/6] 网络优化 (tcpfit + 补充项)"
 
-  # 4a. 安装 tcpfit
   if [ ! -x /usr/local/bin/tcpfit ]; then
     curl -fsSL "$TCPFIT_URL" -o /usr/local/bin/tcpfit \
       || die "tcpfit 下载失败"
@@ -349,16 +429,11 @@ optimize_network(){
     info "tcpfit 已安装: $(tcpfit version 2>&1)"
   fi
 
-  # 4b. tcpfit 基础调优
   local iface; iface=$(detect_iface)
   [ -n "$iface" ] || die "找不到默认路由网卡"
   tcpfit tune --role proxy --bw "$BANDWIDTH" 2>&1 | grep -E "^\[" || true
 
-  # 4c. 补充项（tcpfit 没管的）
-  # 注意加载顺序：sysctl.d 按文件名排序，同名 key 后加载的覆盖先加载的。
-  # 99-deploy-extra.conf < 99-tcpfit.conf，所以这里绝不能放 tcpfit 管着的 key。
   cat > /etc/sysctl.d/99-deploy-extra.conf <<'EOF'
-# 部署脚本补充项 — 与 tcpfit 互补
 net.core.netdev_max_backlog = 250000
 net.ipv4.ip_forward = 1
 net.netfilter.nf_conntrack_max = 524288
@@ -367,7 +442,6 @@ EOF
   sysctl -p /etc/sysctl.d/99-deploy-extra.conf > /dev/null 2>&1 || true
   ok "补充 sysctl: backlog=250000, conntrack=524288, ip_forward=1"
 
-  # 4d. virtio_net 多队列
   if ethtool -l "$iface" 2>/dev/null | grep -q "Combined:.*2"; then
     local cur; cur=$(ethtool -l "$iface" 2>/dev/null | awk '/^Current/{f=1} f && /Combined/{print $2}')
     if [ "$cur" = "1" ]; then
@@ -377,19 +451,15 @@ EOF
     fi
   fi
 
-  # 4e. 时间同步（Reality 握手必需）
   timedatectl set-ntp true 2>/dev/null || true
 
-  # 4f. 限速器扫描 + HTB 整形
   if [ "$SKIP_SWEEP" = 0 ]; then
     if ! command -v iperf3 > /dev/null 2>&1; then
       apt_install iperf3 || true
     fi
     if command -v iperf3 > /dev/null 2>&1; then
-      local peer="$SWEEP_PEER"
-      local best_rtt=""
+      local peer="$SWEEP_PEER" best_rtt=""
       if [ -z "$peer" ]; then
-        # 根据 ping 延迟自动选最近的公共节点
         local candidates="speedtest.lax12.us.leaseweb.net speedtest.sfo12.us.leaseweb.net speedtest.hkg12.hk.leaseweb.net speedtest.tyo11.jp.leaseweb.net speedtest.sin1.sg.leaseweb.net"
         local best_peer=""
         best_rtt=9999
@@ -418,9 +488,8 @@ EOF
   fi
 }
 
-# ─── 阶段 5: 系统附加项（内化自 vps99.sh 的实用部分） ────────────────────────
+# ─── 阶段 5: 系统附加项 ─────────────────────────────────────────────────────
 
-# 时区：只影响日志可读性，不影响 Reality（握手靠的是 NTP 授时）
 setup_timezone(){
   [ "$WITH_TZ" = 1 ] || return 0
   local cur; cur=$(timedatectl show -p Timezone --value 2>/dev/null)
@@ -430,12 +499,6 @@ setup_timezone(){
     || warn "时区设置失败（不影响代理）"
 }
 
-# zRAM 压缩交换：lz4 压内存当 swap 用，比磁盘 swap 快一个量级。
-# 默认 auto：只在【没有活动 swap 且内存 ≤4GB】时部署 —— 有 swap 的机器
-# （比如商家预装的）不动，避免两套 swap 优先级打架。
-# swappiness 取 60-90（zRAM 语义和磁盘 swap 相反：越高越积极用压缩内存），
-# 写在 99-deploy-extra.conf —— tcpfit 只在 harden --swap 时才碰 swappiness，
-# 两者不会同时生效（有 zRAM 就不会跑 harden，反之亦然）。
 setup_zram(){
   [ "$WITH_ZRAM" != no ] || return 0
   if [ "$WITH_ZRAM" = auto ]; then
@@ -450,7 +513,7 @@ setup_zram(){
     fi
   fi
 
-  apt_install zram-tools || { warn "zram-tools 安装失败（apt 锁被占用），跳过 zRAM"; return 0; }
+  apt_install zram-tools || { warn "zram-tools 安装失败，跳过 zRAM"; return 0; }
 
   local ram size swp
   ram=$(awk '/^MemTotal:/{printf "%d",$2/1024}' /proc/meminfo)
@@ -467,26 +530,18 @@ setup_zram(){
     || echo "vm.swappiness = $swp" >> /etc/sysctl.d/99-deploy-extra.conf
 }
 
-# 每周定时清理：journald 保留 7 天/200MB，apt 缓存，docker dangling 镜像。
-# vps99 的 vacuum-time=1s 太激进（等于清空全部日志），代理排障要看最近日志，
-# 这里放宽到 7 天。docker 只清 dangling 镜像，不动用户未运行的命名镜像。
 write_clean_script(){
   cat > "$CLEAN_SCRIPT" <<'CLEANEOF'
 #!/bin/sh
-# vless-deploy 每周清理：apt 缓存 / journald 旧日志 / docker 垃圾
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
-
 if command -v apt-get >/dev/null 2>&1; then
   apt-get autoremove --purge -y >/dev/null 2>&1
   apt-get clean >/dev/null 2>&1
 fi
-
 if command -v journalctl >/dev/null 2>&1; then
   journalctl --rotate >/dev/null 2>&1
   journalctl --vacuum-time=7d --vacuum-size=200M >/dev/null 2>&1
 fi
-
-# docker 只在装了的时候才碰；只清 dangling 镜像和容器日志，不动命名镜像
 if command -v docker >/dev/null 2>&1; then
   docker image prune -f >/dev/null 2>&1
   find /var/lib/docker/containers/ -name "*.log" -exec truncate -s 0 {} \; 2>/dev/null
@@ -499,10 +554,8 @@ setup_cleanup_cron(){
   [ "$WITH_CRON" = 1 ] || return 0
   write_clean_script
   if ! command -v crontab > /dev/null 2>&1; then
-    apt_install cron || { warn "cron 安装失败（apt 锁被占用），跳过定时清理"; return 0; }
+    apt_install cron || { warn "cron 安装失败，跳过定时清理"; return 0; }
   fi
-  # 周一 06:06 —— 避开整点/半点，不和全互联网的 cron 撞车
-  # crontab -l 在无 crontab 时返回 1，set -e 会把它当失败，用 || true 兜底
   ( crontab -l 2>/dev/null | grep -v "$CRON_MARK" || true; echo "6 6 * * 1 $CLEAN_SCRIPT # $CRON_MARK" ) | crontab -
   ok "定时清理已部署: 每周一 06:06 (journald 7d/200M + apt + docker dangling)"
 }
@@ -547,12 +600,11 @@ print_result(){
   printf '  %-14s %s\n' "WARP:"     "${warp_st:-未安装}"
   echo
   echo "${B}── 管理命令 ──${P}"
-  echo "  tcpfit status                          # 查看当前调优状态"
-  echo "  tcpfit verify --peer <iperf3服务器>     # 验证端口吞吐"
-  echo "  tcpfit rollback                        # 回滚所有网络优化"
-  echo "  bash $0 --show-config                  # 重新打印客户端配置"
-  echo "  bash $0 --clean                        # 立即清理系统垃圾"
-  echo "  bash $0 --extras-only                  # 补跑 zRAM/时区/定时清理"
+  echo "  vless-deploy --show-config     # 重新打印客户端配置"
+  echo "  vless-deploy --clean           # 立即清理系统垃圾"
+  echo "  vless-deploy --extras-only     # 补跑 zRAM/时区/定时清理"
+  echo "  tcpfit status                  # 查看当前调优状态"
+  echo "  tcpfit rollback                # 回滚所有网络优化"
   echo
 }
 
@@ -561,6 +613,8 @@ print_result(){
 [ "$DO_CLEAN" = 1 ]    && { need_root; cmd_clean; exit 0; }
 
 need_root
+self_install
+pick_sni
 
 if [ "$OPTIMIZE_ONLY" = 1 ]; then
   optimize_network
